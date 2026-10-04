@@ -19,7 +19,6 @@ def _ms(day, hour=19):
 def _con(tmp_path):
     con = db.connect(tmp_path / "t.sqlite")
     lg = db.start_run(con, "espn_league", "league", SEASON)
-    pl = db.start_run(con, "espn_league", "players", SEASON)
     con.execute("INSERT INTO league_snapshots VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (lg, 1, SEASON, "Fixture", 2, "TOTAL_SEASON_POINTS", "SNAKE", None, 1, "{}"))
     con.execute("INSERT INTO league_scoring VALUES (?,?,?,?)", (lg, 13, 1.0, 0))  # goals = 1 point
@@ -43,13 +42,24 @@ def _con(tmp_path):
         (3, "Lone Defender", "D", 20, "ACTIVE", 20, 4),
         (4, "Free Agent", "RW", 10, "ACTIVE", 30, None),
         (5, "Bench Guy", "G", 30, "ACTIVE", 10, 7),
+        # free agents for the adds test: a healthy 4-game D, a skipped D, a hurt D, a weak F
+        (6, "Good Defender", "D", 10, "ACTIVE", 60, None),
+        (7, "Skipped Defender", "D", 10, "ACTIVE", 70, None),
+        (8, "Hurt Defender", "D", 10, "INJURY_RESERVE", 75, None),
+        (9, "Weak Forward", "C", 20, "ACTIVE", 5, None),
     ]
     for pid, name, pos, team, status, goals, slot in people:
         con.execute("INSERT INTO players (espn_id, full_name, default_position, pro_team_id, active) VALUES (?,?,?,?,1)",
                     (pid, name, pos, team))
-        con.execute("INSERT INTO player_snapshots (run_id, espn_id, pro_team_id, injury_status, injured, on_team_id, roster_status) "
-                    "VALUES (?,?,?,?,?,?,?)", (pl, pid, team, status, 0 if status == "ACTIVE" else 1, 7 if slot else 0,
-                                               "ONTEAM" if slot else "FREEAGENT"))
+    prev = db.start_run(con, "espn_league", "players", SEASON)  # an earlier pull, for the ownership trend
+    for pid, name, pos, team, status, goals, slot in people:
+        con.execute("INSERT INTO player_snapshots (run_id, espn_id, pct_owned) VALUES (?,?,?)", (prev, pid, 10.0))
+    db.finish_run(con, prev, True, 200, len(people))
+    pl = db.start_run(con, "espn_league", "players", SEASON)  # the latest pull must have the higher run_id
+    for pid, name, pos, team, status, goals, slot in people:
+        con.execute("INSERT INTO player_snapshots (run_id, espn_id, pro_team_id, injury_status, injured, on_team_id, roster_status, pct_owned) "
+                    "VALUES (?,?,?,?,?,?,?,?)", (pl, pid, team, status, 0 if status == "ACTIVE" else 1, 7 if slot else 0,
+                                                 "ONTEAM" if slot else "FREEAGENT", 10.0 + pid * 5))
         con.execute("INSERT INTO stat_lines VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (pl, pid, f"10{SEASON}", SEASON, "projection", 1, "league", float(goals), None,
                      json.dumps({"13": goals, "34": 82})))
@@ -84,3 +94,31 @@ def test_report_flags_out_starter_and_empty_slot_and_counts_games(tmp_path):
     assert s["starters"] == 3 and s["games_possible"] == 8 and s["games_playing"] == 6
     text = checkup.render(rep)
     assert "Hurt Forward" in text and "!!! Empty slot: G" in text and "6 of 8 possible games" in text
+
+
+def test_adds_rank_by_gain_and_skip_hurt_and_skipped_players(tmp_path):
+    skip = tmp_path / "skip.txt"
+    skip.write_text("Skipped Defender\n")
+    rep = checkup.build(_con(tmp_path), today=MON, season=SEASON, skip_file=str(skip), moves_left=1)
+    names = [a["name"] for a in rep["adds"]]
+    assert names[0] == "Good Defender"               # healthy, 4 games, beats Lone Defender by 40
+    assert "Skipped Defender" not in names and "Hurt Defender" not in names
+    assert "Weak Forward" not in names               # VOR gain <= 0 never shows
+    top = rep["adds"][0]
+    assert top["replaces"] == "Lone Defender" and top["games"] == 4 and top["gain"] == 40.0
+    assert top["pct_owned"] == 40.0 and top["pct_change"] == 30.0
+
+
+def test_drops_put_the_hurt_starter_first_and_never_the_only_goalie(tmp_path):
+    rep = checkup.build(_con(tmp_path), today=MON, season=SEASON)
+    assert [d["name"] for d in rep["drops"]] == ["Hurt Forward", "Lone Defender"]
+    assert "Bench Guy" not in [d["name"] for d in rep["drops"]]  # the roster's only G
+
+
+def test_trending_and_moves_left_render(tmp_path):
+    rep = checkup.build(_con(tmp_path), today=MON, season=SEASON, moves_left=1)
+    assert rep["trending"][0]["name"] == "Weak Forward" and rep["trending"][0]["pct_change"] == 45.0
+    assert all(t["name"] != "Healthy Forward" for t in rep["trending"])  # rostered players never trend
+    text = checkup.render(rep)
+    assert "## Adds" in text and "Good Defender (D, AAA): +40 over Lone Defender" in text
+    assert "Moves left before Christmas: 1" in text and "!!! Only 1 move left" in text
